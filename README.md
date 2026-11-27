@@ -86,7 +86,7 @@ The ticker and output stream show real commands and real output. Redaction is on
 
 ## Community
 
-Questions, builds, and ideas for what it should show next: join the [MonsterMesh Discord](https://discord.gg/JyC2wPNJ4).
+Questions, builds, and ideas for what it should show next: join the [MonsterMesh Discord](https://discord.gg/WsWwzR4qqx).
 
 ## License
 
