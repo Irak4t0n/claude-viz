@@ -1,0 +1,506 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Claude // Live Activity</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #04050c; overflow: hidden; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+</style>
+</head>
+<body>
+<canvas id="fx"></canvas>
+<canvas id="hud"></canvas>
+<script>
+'use strict';
+/* Claude Live Activity. Keys: D demo, R redact, H hide text, F fullscreen. */
+const SYS = [
+  ['SHELL', '#35e0ff'], ['FILES', '#5b8cff'], ['NET·SSH', '#9d6bff'], ['HARDWARE', '#ff4fd8'],
+  ['CODE', '#ff5a7a'], ['GIT', '#ff9140'], ['WEB', '#ffd23f'], ['SCREEN', '#b6f23c'],
+  ['VAULT', '#3cf2a0'], ['MEDIA', '#2ff0d0']
+];
+const KEY = { SHELL: 0, FILES: 1, NET: 2, HARDWARE: 3, CODE: 4, GIT: 5, WEB: 6, SCREEN: 7, VAULT: 8, MEDIA: 9 };
+const NS = SYS.length;
+const RGB = SYS.map(s => [1, 3, 5].map(i => parseInt(s[1].slice(i, i + 2), 16)));
+const rgba = (i, a) => `rgba(${RGB[i][0]},${RGB[i][1]},${RGB[i][2]},${a})`;
+const FONT_UI = '"Bahnschrift","Segoe UI Variable Display","Segoe UI",system-ui,sans-serif';
+const FONT_MONO = '"Cascadia Mono","Cascadia Code",Consolas,ui-monospace,monospace';
+
+const fx = document.getElementById('fx'), hud = document.getElementById('hud');
+const f = fx.getContext('2d'), h = hud.getContext('2d');
+let W = 0, H = 0, DPR = 1, S = 1, L = {};
+
+// ---------- state ----------
+const heat = new Float32Array(NS), flare = new Float32Array(NS), count = new Uint32Array(NS), acc = new Float32Array(NS);
+const HCOLS = 512, hist = SYS.map(() => new Float32Array(HCOLS)), energyHist = new Float32Array(HCOLS);
+let histHead = 0, E = 0, total = 0, dataIn = 0, last = -1, curTool = '', curSys = -1;
+let live = false, demo = false, redact = true, showText = true, t0 = performance.now(), hintUntil = performance.now() + 9000;
+let link = false, outOn = true, sNext = 0;
+const tele = { cpu: 0, mem: 0, net: 0, disk: 0 }, teleS = { cpu: 0, mem: 0, net: 0, disk: 0 };
+const procs = [], sPend = [], sShown = [];
+function feed(i, head, text) {
+  if (!text) return;
+  sPend.push({ i, t: head, head: true });
+  for (const l of text.replace(/\r/g, '').split('\n').filter(l => l.trim()).slice(0, 16)) sPend.push({ i, t: l.replace(/\t/g, '  ') });
+  while (sPend.length > 140) sPend.shift();
+}
+const stamps = [], ticker = [], packets = [], shocks = [], chains = [];
+const nodes = SYS.map(() => ({ x: 0, y: 0, a: 0 }));
+
+// ---------- particles ----------
+const NMAX = 2600;
+const px = new Float32Array(NMAX), py = new Float32Array(NMAX), ox = new Float32Array(NMAX), oy = new Float32Array(NMAX),
+      vx = new Float32Array(NMAX), vy = new Float32Array(NMAX), life = new Float32Array(NMAX), aff = new Int8Array(NMAX);
+let N = 0;
+function spawn(i) {
+  const a = Math.random() * 6.283, r = (0.25 + Math.random() * 0.95);
+  px[i] = ox[i] = L.cx + Math.cos(a) * L.rx * r; py[i] = oy[i] = L.cy + Math.sin(a) * L.ry * r;
+  vx[i] = vy[i] = 0; life[i] = 200 + Math.random() * 500; aff[i] = -1;
+}
+function burst(n, w) {
+  const k = Math.min(N, Math.round(N * 0.11 * w)), nd = nodes[n];
+  const dx = nd.x - L.cx, dy = nd.y - L.cy, d = Math.hypot(dx, dy) || 1;
+  for (let j = 0; j < k; j++) {
+    const i = (Math.random() * N) | 0, sp = (2 + Math.random() * 5) * S, j2 = (Math.random() - 0.5) * 1.1;
+    px[i] = ox[i] = L.cx + (Math.random() - 0.5) * L.core * 0.8; py[i] = oy[i] = L.cy + (Math.random() - 0.5) * L.core * 0.8;
+    vx[i] = (dx / d) * sp - (dy / d) * sp * j2; vy[i] = (dy / d) * sp + (dx / d) * sp * j2;
+    aff[i] = n; life[i] = 110 + Math.random() * 160;
+  }
+}
+
+// ---------- layout ----------
+function layout() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  for (const c of [fx, hud]) { c.width = Math.round(W * DPR); c.height = Math.round(H * DPR); }
+  f.setTransform(DPR, 0, 0, DPR, 0, 0); h.setTransform(DPR, 0, 0, DPR, 0, 0);
+  f.fillStyle = '#04050c'; f.fillRect(0, 0, W, H);
+  S = Math.max(0.5, Math.min(2.4, Math.min(W, H) / 430));
+  const heatH = H >= 230 ? Math.max(50, H * 0.2) : 0;
+  const top = H >= 230 ? 22 * S : 0;
+  const MH = H - heatH - top;
+  const wide = W / MH > 1.5 && W >= 470;
+  const tickW = wide ? W * (W >= 820 ? 0.27 : 0.31) : 0;
+  const streamW = wide && outOn && W >= 820 ? W * 0.23 : 0;
+  const tickBelow = !wide && H >= 420 && W >= 300 ? 4 : 0;
+  const tbH = tickBelow ? tickBelow * 13 * S + 8 : 0;
+  const AW = W - tickW - streamW, AH = MH - tbH;
+  L = {
+    heatH, top, tickW, streamW, tickBelow, tbH, MH,
+    cx: tickW + AW / 2, cy: top + AH / 2,
+    rx: Math.max(40, AW / 2 - Math.min(88 * S, AW * 0.2)), ry: Math.max(34, AH / 2 - 30 * S)
+  };
+  L.core = Math.min(L.rx, L.ry) * 0.36;
+  for (let i = 0; i < NS; i++) {
+    const a = -Math.PI / 2 + i * (6.283185 / NS);
+    nodes[i].a = a; nodes[i].x = L.cx + Math.cos(a) * L.rx; nodes[i].y = L.cy + Math.sin(a) * L.ry;
+  }
+  const want = Math.max(500, Math.min(NMAX, Math.round(W * H / 330)));
+  // respawn every particle into the new layout so none are stranded where the old one was
+  for (let i = 0; i < want; i++) spawn(i);
+  N = want;
+}
+window.addEventListener('resize', layout);
+
+// ---------- events ----------
+const RX = [
+  [/\b\d{1,3}(?:\.\d{1,3}){3}\b/g, '▒▒.▒▒.▒▒.▒▒'],
+  [/\b[\w.-]+@(?=[\w▒.-])/g, '▒▒▒@'],
+  [/((?:pass(?:word|wd)?|token|secret|apikey|api_key|pwd)\s*[=: ]\s*)\S+/gi, '$1▒▒▒▒'],
+  [/(Users[\\/]{1,2})[^\\/\s"']+/gi, '$1▒▒▒'],
+  [/\b[A-Za-z0-9+\/_-]{28,}\b/g, '▒▒▒▒▒▒']
+];
+const scrub = s => { if (!redact) return s; for (const [r, v] of RX) s = s.replace(r, v); return s; };
+
+function onEvent(ev) {
+  const i = KEY[ev.sys] ?? 0, w = ev.w || 1, now = performance.now();
+  if (ev.kind === 'tele') {
+    tele.cpu = ev.cpu / 100; tele.mem = ev.mem / 100;
+    tele.net = Math.min(1, Math.log10(1 + ev.net / 1e3) / 4.3); tele.disk = Math.min(1, Math.log10(1 + ev.disk / 1e3) / 5);
+    return;
+  }
+  if (ev.kind === 'link') { link = !!ev.on; return; }
+  if (ev.kind === 'proc') {             // a real process spawned under one of my commands
+    if (ev.h) return;
+    procs.push({ n: i, name: ev.detail || '', ang: Math.random() * 6.283, life: 1 }); if (procs.length > 40) procs.shift();
+    heat[i] = Math.min(1.7, heat[i] + 0.2); flare[i] = Math.max(flare[i], 0.6); acc[i] += 0.3; E = Math.min(2.4, E + 0.12);
+    packets.push({ n: i, t: 0, sp: 0.03, back: false, bend: (Math.random() - 0.5) * 1.2 });
+    return;
+  }
+  if (ev.delay && !ev.h) { const d = ev.delay; setTimeout(() => onEvent(Object.assign({}, ev, { delay: 0 })), d); return; }
+  if (ev.kind === 'done') {             // result came back: data flows node -> core
+    if (ev.h) return;
+    dataIn += ev.bytes || 0;
+    const n = last >= 0 ? last : i;
+    feed(n, `◂ ${ev.tool} · ${fmtBytes(ev.bytes || 0)}`, ev.out);
+    for (let k = 0; k < 3; k++) packets.push({ n, t: -k * 0.12, sp: 0.02 + Math.random() * 0.012, back: true, bend: (Math.random() - 0.5) * 0.7 });
+    E = Math.min(2.4, E + 0.12);
+    return;
+  }
+  total++; count[i]++;
+  ticker.unshift({ i, tool: ev.tool || '', detail: ev.detail || '', at: new Date(ev.t || Date.now()), born: ev.h ? 0 : now });
+  if (ticker.length > 40) ticker.pop();
+  if (ev.h) return;                     // replayed history: list only, no fireworks
+  stamps.push(now);
+  heat[i] = Math.min(1.7, heat[i] + 0.5 * w); flare[i] = 1; acc[i] += w;
+  E = Math.min(2.4, E + 0.4 * w);
+  const np = 2 + Math.round(3 * w);
+  for (let k = 0; k < np; k++) packets.push({ n: i, t: -k * 0.07, sp: 0.016 + Math.random() * 0.014, back: false, bend: (Math.random() - 0.5) * 0.8 });
+  shocks.push({ n: i, r: 0, a: 1 });
+  burst(i, w);
+  if (last >= 0 && last !== i) chains.push({ a: last, b: i, life: 1 });
+  last = i; curSys = i; curTool = ev.tool || '';
+  if (ev.out) feed(i, `▸ ${ev.tool} · ${fmtBytes(ev.nbytes || 0)}`, ev.out);
+}
+
+function connect() {
+  const es = new EventSource('/events');
+  let wasDown = false;
+  es.onopen = () => { if (wasDown) { location.reload(); return; } live = true; };
+  es.onerror = () => { live = false; wasDown = true; };
+  es.onmessage = m => { try { onEvent(JSON.parse(m.data)); } catch (e) {} };
+}
+
+const DEMO = [
+  ['SHELL', 'start_process', 'Get-ChildItem -Recurse | Sort LastWriteTime'], ['NET', 'start_process', 'ssh pi@10.0.0.42 "systemctl status app"'],
+  ['HARDWARE', 'start_process', 'esptool --port COM7 write_flash 0x0 firmware.bin'], ['FILES', 'read_file', 'C:\\Users\\demo\\project\\main.cpp'],
+  ['FILES', 'edit_block', 'C:\\Users\\demo\\project\\config.h'], ['CODE', 'start_process', 'python build.py --release'],
+  ['GIT', 'start_process', 'git commit -m "wire up display driver"'], ['WEB', 'chrome', 'browser activity'],
+  ['VAULT', 'obsidian', 'tool call'], ['MEDIA', 'DaVinci Resolve Studio', 'tool call'], ['SCREEN', 'computer_screenshot', '']
+];
+const DEMO_OUT = [
+  'Process started\nbuild: 214 files compiled\nlinking firmware.elf\nsize: 1.2 MB (61% of flash)\ndone in 18.4s',
+  'Connecting....\nChip is ESP32-C5 (revision v1.0)\nWriting at 0x00010000... (42 %)\nWriting at 0x00048000... (100 %)\nHash of data verified.',
+  'active (running) since Mon 09:14\nMemory: 38.2M\nCPU: 4.1s\nlistening on :8080',
+  '#include "display.h"\nvoid setup() {\n  display.begin();\n  display.setRotation(1);\n}',
+  '[main 4f2a9c1] wire up display driver\n 3 files changed, 87 insertions(+), 12 deletions(-)'
+];
+let demoNext = 0;
+function demoTick(now) {
+  if (!demo || now < demoNext) return;
+  const d = DEMO[(Math.random() * DEMO.length) | 0];
+  onEvent({ sys: d[0], tool: d[1], detail: d[2], w: 0.6 + Math.random() * 0.6, t: Date.now() });
+  if (Math.random() < 0.6) setTimeout(() => demo && onEvent({ kind: 'done', sys: d[0], tool: d[1], bytes: 400 + Math.random() * 9000, out: DEMO_OUT[(Math.random() * DEMO_OUT.length) | 0] }), 300 + Math.random() * 900);
+  demoNext = now + (Math.random() < 0.35 ? 90 + Math.random() * 200 : 500 + Math.random() * 1600);
+}
+window.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (k === 'd') demo = !demo;
+  else if (k === 'r') redact = !redact;
+  else if (k === 'h') showText = !showText;
+  else if (k === 'o') { outOn = !outOn; layout(); }
+  else if (k === 'f') { document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen(); }
+});
+
+// ---------- helpers ----------
+const STOPS = [[10, 8, 30], [64, 20, 120], [176, 38, 140], [248, 110, 60], [255, 222, 130], [255, 255, 255]];
+function ramp(v) {
+  v = Math.max(0, Math.min(0.9999, v)) * (STOPS.length - 1);
+  const i = v | 0, k = v - i, a = STOPS[i], b = STOPS[i + 1];
+  return `rgb(${(a[0] + (b[0] - a[0]) * k) | 0},${(a[1] + (b[1] - a[1]) * k) | 0},${(a[2] + (b[2] - a[2]) * k) | 0})`;
+}
+const fmtBytes = b => b < 1024 ? b + ' B' : b < 1048576 ? (b / 1024).toFixed(1) + ' KB' : (b / 1048576).toFixed(2) + ' MB';
+const pad = n => String(n).padStart(2, '0');
+const GL = '░▒▓█▚▞▙▟01<>/\\#$%&*+=';
+function scramble(s, born, now) {
+  const age = now - born; if (!born || age > 520) return s;
+  const keep = Math.floor(s.length * age / 520); let o = s.slice(0, keep);
+  for (let i = keep; i < s.length; i++) o += s[i] === ' ' ? ' ' : GL[(Math.random() * GL.length) | 0];
+  return o;
+}
+function ctrl(nd, bend) {
+  const mx = (L.cx + nd.x) / 2, my = (L.cy + nd.y) / 2, dx = nd.x - L.cx, dy = nd.y - L.cy;
+  return [mx - dy * bend * 0.35, my + dx * bend * 0.35];
+}
+function qpt(nd, c, t) {
+  const u = 1 - t;
+  return [u * u * L.cx + 2 * u * t * c[0] + t * t * nd.x, u * u * L.cy + 2 * u * t * c[1] + t * t * nd.y];
+}
+
+// ---------- render ----------
+let prev = performance.now(), lastCol = performance.now();
+function frame(now) {
+  const dt = Math.min(3, (now - prev) / 16.667); prev = now;
+  const T = now / 1000;
+  demoTick(now);
+  if (sPend.length && now >= sNext) { sShown.push(Object.assign(sPend.shift(), { born: now })); if (sShown.length > 90) sShown.shift(); sNext = now + (sPend.length > 24 ? 16 : 42); }
+  for (const k in tele) teleS[k] += (tele[k] - teleS[k]) * Math.min(1, 0.08 * dt);
+  while (stamps.length && now - stamps[0] > 60000) stamps.shift();
+  E *= Math.pow(0.975, dt);
+  for (let i = 0; i < NS; i++) { heat[i] *= Math.pow(0.988, dt); flare[i] *= Math.pow(0.9, dt); }
+  if (now - lastCol > 400) {
+    lastCol = now; histHead = (histHead + 1) % HCOLS;
+    for (let i = 0; i < NS; i++) { hist[i][histHead] = Math.min(1, acc[i] * 0.55 + heat[i] * 0.35); acc[i] = 0; }
+    energyHist[histHead] = Math.min(1, E / 1.8);
+  }
+
+  // --- particle field (trails on fx canvas)
+  f.globalCompositeOperation = 'source-over';
+  f.fillStyle = `rgba(4,5,12,${0.15 + 0.05 * Math.min(1, E)})`; f.fillRect(0, 0, W, H);
+  f.globalCompositeOperation = 'lighter';
+  const fk = 0.011 / S, spd = (0.32 + E * 0.9) * S, damp = Math.pow(0.93, dt);
+  for (let i = 0; i < N; i++) {
+    ox[i] = px[i]; oy[i] = py[i];
+    const x = px[i], y = py[i], dx = x - L.cx, dy = y - L.cy, d = Math.hypot(dx / L.rx, dy / L.ry) + 0.001;
+    const a = Math.sin(x * fk + T * 0.31) * 1.7 + Math.cos(y * fk * 1.3 - T * 0.23) * 1.7 + Math.sin((x + y) * fk * 0.6 + T * 0.13) * 1.2;
+    let ax = Math.cos(a) * 0.09 + (-dy / (L.ry * d)) * 0.10, ay = Math.sin(a) * 0.09 + (dx / (L.rx * d)) * 0.10;
+    const g = aff[i];
+    if (g >= 0) {
+      const nd = nodes[g], tx = nd.x - x, ty = nd.y - y, td = Math.hypot(tx, ty) + 1;
+      const pull = 0.12 + heat[g] * 0.22; ax += tx / td * pull; ay += ty / td * pull;
+      if (td < 14 * S) life[i] = Math.min(life[i], 12);
+    } else if (d > 1.25) { ax -= dx / (L.rx * d) * 0.12; ay -= dy / (L.ry * d) * 0.12; }
+    vx[i] = (vx[i] + ax * spd * dt) * damp; vy[i] = (vy[i] + ay * spd * dt) * damp;
+    px[i] += vx[i] * dt; py[i] += vy[i] * dt; life[i] -= dt;
+    if (life[i] <= 0 || px[i] < -20 || px[i] > W + 20 || py[i] < -20 || py[i] > H + 20) spawn(i);
+  }
+  f.lineWidth = Math.max(0.8, 1.05 * S);
+  for (let g = -1; g < NS; g++) {
+    f.beginPath();
+    for (let i = 0; i < N; i++) if (aff[i] === g) { f.moveTo(ox[i], oy[i]); f.lineTo(px[i], py[i]); }
+    f.strokeStyle = g < 0 ? `rgba(96,128,255,${0.32 + 0.14 * Math.min(1, E)})` : rgba(g, 0.62);
+    f.stroke();
+  }
+
+  // --- HUD
+  h.clearRect(0, 0, W, H);
+  h.lineCap = 'round';
+  // polar grid + sweep
+  h.save(); h.translate(L.cx, L.cy);
+  h.strokeStyle = 'rgba(120,140,255,0.07)'; h.lineWidth = 1;
+  for (let k = 1; k <= 4; k++) { h.beginPath(); h.ellipse(0, 0, L.rx * k / 4 * 1.12, L.ry * k / 4 * 1.12, 0, 0, 6.2832); h.stroke(); }
+  for (let k = 0; k < 24; k++) {
+    const a = k * 0.2618 + T * 0.03;
+    h.beginPath(); h.moveTo(Math.cos(a) * L.core * 1.5, Math.sin(a) * L.core * 1.5 * L.ry / L.rx);
+    h.lineTo(Math.cos(a) * L.rx * 1.12, Math.sin(a) * L.ry * 1.12); h.stroke();
+  }
+  if (h.createConicGradient) {
+    const sw = T * 0.9, cg = h.createConicGradient(sw, 0, 0);
+    cg.addColorStop(0, 'rgba(90,200,255,0)'); cg.addColorStop(0.86, 'rgba(90,200,255,0)');
+    cg.addColorStop(1, `rgba(120,220,255,${0.10 + 0.08 * Math.min(1, E)})`);
+    h.fillStyle = cg; h.beginPath(); h.ellipse(0, 0, L.rx * 1.12, L.ry * 1.12, 0, 0, 6.2832); h.fill();
+  }
+  h.restore();
+
+  // links, chains, packets
+  for (let i = 0; i < NS; i++) {
+    const nd = nodes[i], c = ctrl(nd, 0.25);
+    h.strokeStyle = rgba(i, 0.07 + Math.min(0.5, heat[i] * 0.4)); h.lineWidth = (0.8 + heat[i] * 1.6) * S;
+    h.setLineDash([5 * S, 7 * S]); h.lineDashOffset = -T * (20 + heat[i] * 90);
+    h.beginPath(); h.moveTo(L.cx, L.cy); h.quadraticCurveTo(c[0], c[1], nd.x, nd.y); h.stroke();
+  }
+  h.setLineDash([]);
+  for (let k = chains.length - 1; k >= 0; k--) {
+    const c = chains[k], A = nodes[c.a], B = nodes[c.b]; c.life -= 0.02 * dt;
+    if (c.life <= 0) { chains.splice(k, 1); continue; }
+    const g = h.createLinearGradient(A.x, A.y, B.x, B.y); g.addColorStop(0, rgba(c.a, c.life * 0.8)); g.addColorStop(1, rgba(c.b, c.life * 0.8));
+    h.strokeStyle = g; h.lineWidth = 2 * S * c.life + 0.5;
+    h.beginPath(); h.moveTo(A.x, A.y); h.quadraticCurveTo(L.cx + (A.x + B.x - 2 * L.cx) * 0.62, L.cy + (A.y + B.y - 2 * L.cy) * 0.62, B.x, B.y); h.stroke();
+  }
+  h.globalCompositeOperation = 'lighter';
+  for (let k = packets.length - 1; k >= 0; k--) {
+    const p = packets[k]; p.t += p.sp * dt;
+    if (p.t >= 1) { packets.splice(k, 1); continue; }
+    if (p.t < 0) continue;
+    const nd = nodes[p.n], c = ctrl(nd, p.bend);
+    for (let j = 0; j < 6; j++) {
+      const tt = Math.max(0, p.t - j * 0.022), q = qpt(nd, c, p.back ? 1 - tt : tt);
+      h.fillStyle = p.back ? `rgba(255,255,255,${0.75 - j * 0.12})` : rgba(p.n, 0.95 - j * 0.15);
+      h.beginPath(); h.arc(q[0], q[1], Math.max(0.6, (3.2 - j * 0.45) * S), 0, 6.2832); h.fill();
+    }
+  }
+  for (let k = shocks.length - 1; k >= 0; k--) {
+    const s = shocks[k]; s.r += 2.6 * S * dt; s.a -= 0.028 * dt;
+    if (s.a <= 0) { shocks.splice(k, 1); continue; }
+    h.strokeStyle = rgba(s.n, s.a); h.lineWidth = 2 * S * s.a + 0.4;
+    h.beginPath(); h.arc(nodes[s.n].x, nodes[s.n].y, 8 * S + s.r, 0, 6.2832); h.stroke();
+  }
+
+  // nodes
+  const fs = Math.max(8, 10.5 * S);
+  for (let i = 0; i < NS; i++) {
+    const nd = nodes[i], nr = (8 + flare[i] * 5 + Math.min(1, heat[i]) * 3) * S, hv = Math.min(1, heat[i]);
+    const gr = h.createRadialGradient(nd.x, nd.y, 0, nd.x, nd.y, nr * (2.6 + hv * 2));
+    gr.addColorStop(0, rgba(i, 0.25 + hv * 0.6)); gr.addColorStop(1, rgba(i, 0));
+    h.fillStyle = gr; h.beginPath(); h.arc(nd.x, nd.y, nr * (2.6 + hv * 2), 0, 6.2832); h.fill();
+    h.strokeStyle = rgba(i, 0.45 + hv * 0.55); h.lineWidth = 1.2 * S;
+    h.beginPath(); h.arc(nd.x, nd.y, nr, 0, 6.2832); h.stroke();
+    h.lineWidth = 2.6 * S; h.beginPath(); h.arc(nd.x, nd.y, nr + 4 * S, -1.5708 + T * (0.4 + i * 0.07), -1.5708 + T * (0.4 + i * 0.07) + 0.6 + hv * 5.4); h.stroke();
+    h.fillStyle = rgba(i, 0.35 + hv * 0.65); h.beginPath(); h.arc(nd.x, nd.y, nr * 0.42, 0, 6.2832); h.fill();
+  }
+  h.globalCompositeOperation = 'source-over';
+  if (showText) for (let i = 0; i < NS; i++) {
+    const nd = nodes[i], ca = Math.cos(nd.a), sa = Math.sin(nd.a), off = 20 * S;
+    h.font = `600 ${fs}px ${FONT_UI}`; h.textAlign = ca > 0.3 ? 'left' : ca < -0.3 ? 'right' : 'center'; h.textBaseline = 'middle';
+    const tx = nd.x + ca * off, ty = nd.y + sa * off * (Math.abs(ca) < 0.3 ? 1.15 : 0.55);
+    h.fillStyle = rgba(i, 0.55 + Math.min(0.45, heat[i])); h.fillText(SYS[i][0], tx, ty);
+    h.font = `${fs * 0.82}px ${FONT_MONO}`; h.fillStyle = 'rgba(190,200,240,0.55)'; h.fillText(String(count[i]), tx, ty + fs * 1.05);
+  }
+
+  // process satellites
+  for (let k = procs.length - 1; k >= 0; k--) {
+    const p = procs[k]; p.life -= 0.0055 * dt; p.ang += 0.045 * dt;
+    if (p.life <= 0) { procs.splice(k, 1); continue; }
+    const nd = nodes[p.n], r = (24 + (k % 3) * 7) * S, x = nd.x + Math.cos(p.ang) * r, y = nd.y + Math.sin(p.ang) * r;
+    h.fillStyle = rgba(p.n, Math.min(1, p.life * 1.4)); h.beginPath(); h.arc(x, y, 2.2 * S, 0, 6.2832); h.fill();
+    h.strokeStyle = rgba(p.n, p.life * 0.5); h.lineWidth = 1; h.beginPath(); h.moveTo(nd.x, nd.y); h.lineTo(x, y); h.stroke();
+    if (showText && W > 380) { h.font = `${Math.max(7, 8 * S)}px ${FONT_MONO}`; h.textAlign = 'center'; h.textBaseline = 'bottom'; h.fillStyle = `rgba(225,232,255,${Math.min(0.9, p.life * 1.3)})`; h.fillText(p.name, x, y - 4 * S); }
+  }
+
+  // core
+  h.save(); h.translate(L.cx, L.cy); h.globalCompositeOperation = 'lighter';
+  const cr = L.core, pulse = 1 + Math.sin(T * 3) * 0.02 + Math.min(1, E) * 0.08;
+  const cg2 = h.createRadialGradient(0, 0, 0, 0, 0, cr * 1.5 * pulse);
+  const ci = curSys < 0 ? 0 : curSys, mix = Math.min(1, E);
+  cg2.addColorStop(0, `rgba(160,180,255,${0.10 + mix * 0.22})`); cg2.addColorStop(0.55, rgba(ci, 0.05 + mix * 0.16)); cg2.addColorStop(1, 'rgba(0,0,0,0)');
+  h.fillStyle = cg2; h.beginPath(); h.arc(0, 0, cr * 1.5 * pulse, 0, 6.2832); h.fill();
+  const BARS = 90; h.lineWidth = Math.max(1, cr * 0.035);
+  for (let k = 0; k < BARS; k++) {
+    const a = k / BARS * 6.2832 - 1.5708 + T * 0.05, seg = k / BARS * NS, i0 = seg | 0, i1 = (i0 + 1) % NS, fr = seg - i0;
+    const hv = heat[i0] * (1 - fr) + heat[i1] * fr;
+    const nz = 0.5 + 0.5 * Math.sin(k * 1.7 + T * 5.1) * Math.sin(k * 0.37 - T * 2.3);
+    const len = cr * (0.05 + nz * 0.07 * (0.5 + E) + hv * 0.34 * (0.6 + 0.4 * nz));
+    h.strokeStyle = rgba(fr < 0.5 ? i0 : i1, 0.3 + Math.min(0.7, hv));
+    h.beginPath(); h.moveTo(Math.cos(a) * cr * 0.8, Math.sin(a) * cr * 0.8); h.lineTo(Math.cos(a) * (cr * 0.8 + len), Math.sin(a) * (cr * 0.8 + len)); h.stroke();
+  }
+  const rings = [[0.72, 1.1, 0.7, 1.6], [0.64, -0.8, 2.1, 1.1], [0.56, 1.7, 4.0, 0.7], [0.72, 1.1, 3.9, 1.2], [0.64, -0.8, 5.2, 0.6]];
+  for (const [rr, sp2, ph, ln] of rings) {
+    h.strokeStyle = `rgba(150,190,255,${0.3 + mix * 0.4})`; h.lineWidth = Math.max(1, cr * 0.028);
+    const a0 = T * sp2 * (0.5 + E) * 0.6 + ph; h.beginPath(); h.arc(0, 0, cr * rr, a0, a0 + ln); h.stroke();
+  }
+  // machine telemetry arcs (real CPU / RAM / network / disk) + tools-engaged ring
+  const TQ = [['cpu', 0.7854, '#35e0ff'], ['mem', 2.3562, '#9d6bff'], ['net', 3.927, '#3cf2a0'], ['disk', 5.4978, '#ffd23f']];
+  for (const [k, mid, colr] of TQ) {
+    const a0 = mid - 0.66, span = 1.32, R2 = cr * 1.62;
+    h.lineWidth = Math.max(1.5, cr * 0.05); h.strokeStyle = 'rgba(120,140,255,0.14)'; h.beginPath(); h.arc(0, 0, R2, a0, a0 + span); h.stroke();
+    h.strokeStyle = colr; h.globalAlpha = 0.85; h.beginPath(); h.arc(0, 0, R2, a0, a0 + span * Math.max(0.02, Math.min(1, teleS[k]))); h.stroke(); h.globalAlpha = 1;
+  }
+  if (link) {
+    h.setLineDash([cr * 0.12, cr * 0.07]); h.lineDashOffset = -T * cr * 0.9; h.lineWidth = Math.max(1.2, cr * 0.03);
+    h.strokeStyle = 'rgba(60,242,160,0.8)'; h.beginPath(); h.arc(0, 0, cr * 1.06, 0, 6.2832); h.stroke(); h.setLineDash([]);
+  }
+  h.restore(); h.globalCompositeOperation = 'source-over';
+  if (showText && cr > 40) {
+    h.font = `600 ${Math.max(6.5, cr * 0.1)}px ${FONT_UI}`; h.textAlign = 'center'; h.textBaseline = 'middle';
+    const TL = [['CPU ' + Math.round(teleS.cpu * 100) + '%', 0.7854], ['RAM ' + Math.round(teleS.mem * 100) + '%', 2.3562], ['NET', 3.927], ['DISK', 5.4978]];
+    for (const [txt, a] of TL) { h.fillStyle = 'rgba(190,205,245,0.7)'; h.fillText(txt, L.cx + Math.cos(a) * cr * 1.84, L.cy + Math.sin(a) * cr * 1.84); }
+  }
+  if (showText && cr > 26) {
+    h.fillStyle = 'rgba(4,5,12,0.6)'; h.beginPath(); h.arc(L.cx, L.cy, cr * 0.5, 0, 6.2832); h.fill();
+    h.textAlign = 'center'; h.textBaseline = 'middle';
+    h.font = `700 ${cr * 0.52}px ${FONT_UI}`; h.fillStyle = '#eef2ff'; h.fillText(String(stamps.length), L.cx, L.cy - cr * 0.04);
+    h.font = `600 ${Math.max(6.5, cr * 0.115)}px ${FONT_UI}`; h.fillStyle = 'rgba(170,185,235,0.8)'; h.fillText('ACTIONS / MIN', L.cx, L.cy + cr * 0.3);
+  }
+
+  // header + stats
+  if (showText && L.top) {
+    const hf = Math.max(8.5, 10.5 * S), y = 12 * S;
+    h.textBaseline = 'middle'; h.textAlign = 'left';
+    const col = demo ? '#ffd23f' : live ? '#3cf2a0' : '#ff5a7a';
+    h.fillStyle = col; h.globalAlpha = 0.55 + 0.45 * Math.sin(T * 4); h.beginPath(); h.arc(11 * S, y, 3.4 * S, 0, 6.2832); h.fill(); h.globalAlpha = 1;
+    h.font = `700 ${hf}px ${FONT_UI}`; h.fillStyle = '#dfe6ff';
+    const title = 'CLAUDE // LIVE ACTIVITY'; h.fillText(title, 20 * S, y);
+    const tw = h.measureText(title).width;
+    h.font = `600 ${hf * 0.86}px ${FONT_MONO}`; h.fillStyle = col;
+    const stat = demo ? 'DEMO DATA' : live ? (link ? 'LIVE · TOOLS ENGAGED' : 'LIVE') : 'FEED OFFLINE';
+    h.fillText(stat, 28 * S + tw, y); const sw2 = h.measureText(stat).width;
+    const up = Math.floor((now - t0) / 1000);
+    let hot = -1; for (let i = 0; i < NS; i++) if (heat[i] > 0.08 && (hot < 0 || heat[i] > heat[hot])) hot = i;
+    const parts = [`TOTAL ${total}`, `DATA IN ${fmtBytes(Math.round(dataIn))}`, `UP ${pad(up / 3600 | 0)}:${pad(up / 60 % 60 | 0)}:${pad(up % 60)}`];
+    if (hot >= 0) parts.push('HOT ' + SYS[hot][0]);
+    h.textAlign = 'right'; h.fillStyle = 'rgba(175,188,235,0.85)';
+    let str = parts.join('   ·   ');
+    while (parts.length > 1 && h.measureText(str).width > W - tw - sw2 - 60 * S) { parts.shift(); str = parts.join('   ·   '); }
+    if (h.measureText(str).width < W - tw - sw2 - 44 * S) h.fillText(str, W - 10 * S, y);
+  }
+
+  // ticker
+  if (showText && (L.tickW || L.tickBelow)) {
+    const tf = Math.max(8, 9.6 * S), lh = tf * 1.42, side = !!L.tickW;
+    const x0 = 10 * S, y0 = side ? L.top + 14 * S : L.top + L.MH - L.tbH + 6;
+    const wAvail = (side ? L.tickW - 6 * S : W - 16 * S) - x0, rows = side ? Math.floor((L.MH - 22 * S) / (lh * 2.25)) : L.tickBelow;
+    if (side) {
+      const bg = h.createLinearGradient(0, 0, L.tickW, 0); bg.addColorStop(0, 'rgba(4,5,12,0.78)'); bg.addColorStop(1, 'rgba(4,5,12,0)');
+      h.fillStyle = bg; h.fillRect(0, L.top, L.tickW * 1.1, L.MH);
+    }
+    h.textAlign = 'left'; h.textBaseline = 'top';
+    const cw = tf * 0.56, maxc = Math.max(8, Math.floor(wAvail / cw));
+    for (let k = 0; k < Math.min(rows, ticker.length); k++) {
+      const e = ticker[k], fade = Math.max(0.16, 1 - k / (rows + 1)), y = y0 + k * (side ? lh * 2.25 : lh);
+      const ts = `${pad(e.at.getHours())}:${pad(e.at.getMinutes())}:${pad(e.at.getSeconds())}`;
+      h.font = `700 ${tf}px ${FONT_MONO}`;
+      if (k === 0 && e.born && now - e.born < 900) { h.fillStyle = rgba(e.i, 0.16 * (1 - (now - e.born) / 900)); h.fillRect(0, y - 3, side ? L.tickW : W, (side ? lh * 2 : lh) + 3); }
+      h.fillStyle = rgba(e.i, fade); h.fillRect(x0 - 5 * S, y, 2 * S, side ? lh * 1.9 : lh * 0.85);
+      const head = `${ts} ${SYS[e.i][0]} › ${e.tool}`;
+      const det = scramble(scrub(e.detail), e.born, now);
+      if (side) {
+        h.fillText(head.slice(0, maxc), x0, y);
+        h.font = `${tf}px ${FONT_MONO}`; h.fillStyle = `rgba(200,210,245,${fade * 0.8})`;
+        h.fillText(det.length > maxc ? det.slice(0, maxc - 1) + '…' : det, x0, y + lh * 0.98);
+      } else {
+        h.fillText(head.slice(0, maxc), x0, y);
+        const hw = h.measureText(head.slice(0, maxc)).width + tf, room = Math.floor((wAvail - hw) / cw);
+        if (room > 6) { h.font = `${tf}px ${FONT_MONO}`; h.fillStyle = `rgba(200,210,245,${fade * 0.8})`; h.fillText(det.length > room ? det.slice(0, room - 1) + '…' : det, x0 + hw, y); }
+      }
+    }
+  }
+
+  // output stream: what actually came back / got written
+  if (showText && L.streamW) {
+    const tf = Math.max(7.5, 8.6 * S), lh = tf * 1.36, x0 = W - L.streamW + 10 * S, wAvail = L.streamW - 16 * S;
+    const bg = h.createLinearGradient(W - L.streamW * 1.1, 0, W, 0); bg.addColorStop(0, 'rgba(4,5,12,0)'); bg.addColorStop(1, 'rgba(4,5,12,0.8)');
+    h.fillStyle = bg; h.fillRect(W - L.streamW * 1.1, L.top, L.streamW * 1.1, L.MH);
+    h.textAlign = 'left'; h.textBaseline = 'top';
+    h.font = `700 ${tf}px ${FONT_UI}`; h.fillStyle = 'rgba(170,185,235,0.75)'; h.fillText('OUTPUT STREAM', x0, L.top + 8 * S);
+    const yTop = L.top + 8 * S + lh * 1.5, rows = Math.floor((L.top + L.MH - 8 * S - yTop) / lh), maxc = Math.max(6, Math.floor(wAvail / (tf * 0.56)));
+    const n = Math.min(rows, sShown.length);
+    for (let k = 0; k < n; k++) {
+      const e = sShown[sShown.length - n + k], fade = 0.2 + 0.8 * (k + 1) / n, y = yTop + k * lh;
+      h.font = `${e.head ? 700 : 400} ${tf}px ${FONT_MONO}`;
+      h.fillStyle = e.head ? rgba(e.i, fade) : `rgba(200,210,245,${fade * 0.82})`;
+      h.fillText(scramble(scrub(e.t).slice(0, maxc), e.born, now), x0, y);
+    }
+    if ((T * 2 | 0) % 2 === 0) { h.fillStyle = 'rgba(120,220,255,0.8)'; h.fillRect(x0, yTop + n * lh, tf * 0.55, tf); }
+  }
+
+  // heat strip + energy line
+  if (L.heatH) {
+    const y0 = H - L.heatH, labW = showText && W >= 380 ? 62 * S : 0, gap = 1, cellW = Math.max(3, 5.5 * S);
+    const cols = Math.min(HCOLS - 1, Math.floor((W - labW - 8) / cellW)), eh = L.heatH * 0.2, gy = y0 + eh + 3, rowH = (L.heatH - eh - 7) / NS;
+    h.fillStyle = 'rgba(4,5,12,0.72)'; h.fillRect(0, y0 - 2, W, L.heatH + 2);
+    const sub = (now - lastCol) / 400;
+    for (let i = 0; i < NS; i++) {
+      for (let c = 0; c < cols; c++) {
+        const v = hist[i][(histHead - c + HCOLS * 2) % HCOLS];
+        const x = W - 4 - (c + 1) * cellW;
+        h.fillStyle = v > 0.015 ? ramp(0.14 + v * 0.86) : 'rgba(40,36,80,0.35)';
+        h.fillRect(x, gy + i * rowH, cellW - gap, Math.max(1, rowH - gap));
+      }
+      if (labW && rowH >= 6.5) {
+        h.font = `600 ${Math.max(6, Math.min(rowH * 0.95, 8.4 * S))}px ${FONT_UI}`; h.textAlign = 'right'; h.textBaseline = 'middle';
+        h.fillStyle = rgba(i, 0.5 + Math.min(0.5, heat[i])); h.fillText(SYS[i][0], labW - 4, gy + i * rowH + rowH / 2);
+      }
+    }
+    h.beginPath(); h.moveTo(W - 4, y0 + eh);
+    for (let c = 0; c < cols; c++) h.lineTo(W - 4 - (c + 0.5) * cellW, y0 + eh - energyHist[(histHead - c + HCOLS * 2) % HCOLS] * eh * 0.95);
+    h.lineTo(W - 4 - cols * cellW, y0 + eh); h.closePath();
+    const eg = h.createLinearGradient(0, y0, 0, y0 + eh); eg.addColorStop(0, 'rgba(255,90,170,0.75)'); eg.addColorStop(1, 'rgba(90,120,255,0.08)');
+    h.fillStyle = eg; h.fill();
+    h.fillStyle = `rgba(255,255,255,${0.5 * (1 - sub)})`; h.fillRect(W - 4 - cellW, gy, cellW - gap, rowH * NS - gap);
+  }
+
+  if (showText && L.heatH && now < hintUntil && W > 420) {
+    h.font = `${Math.max(8, 9 * S)}px ${FONT_MONO}`; h.textAlign = 'left'; h.textBaseline = 'bottom';
+    h.fillStyle = `rgba(200,210,245,${Math.min(0.75, (hintUntil - now) / 1500)})`;
+    h.fillText('D demo   R redact   O output   H hide text   F fullscreen', 10 * S, H - L.heatH + L.heatH * 0.2);
+  }
+  requestAnimationFrame(frame);
+}
+
+layout();
+if (new URLSearchParams(location.search).has('demo')) demo = true;
+connect();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
