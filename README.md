@@ -6,6 +6,8 @@ A live visualizer for what Claude is doing on your Windows PC. It runs in its ow
 
 *Screenshot shows demo mode (press `D`), not a real session.*
 
+See it move: [8-second clip](media/claude-viz-wide.mp4) · [vertical cut](media/claude-viz-vertical.mp4) (both recorded in demo mode).
+
 This is an unofficial community project. It is not made by or affiliated with Anthropic.
 
 ## What you see
