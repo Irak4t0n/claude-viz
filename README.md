@@ -84,6 +84,10 @@ The ticker and output stream show real commands and real output. Redaction is on
 - How shell commands are sorted into subsystems: `classify_cmd()` in `server.py`
 - Port: set `CLAUDE_VIZ_PORT` before starting
 
+## Community
+
+Questions, builds, and ideas for what it should show next: join the [MonsterMesh Discord](https://discord.gg/JyC2wPNJ4).
+
 ## License
 
 MIT
